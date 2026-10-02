@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "test:merge": "esbuild scripts/merge.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/merge.test.mjs && node node_modules/.cache/merge.test.mjs"
   },
   "dependencies": {
     "naive-ui": "^2.40.4",
