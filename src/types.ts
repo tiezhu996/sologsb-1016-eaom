@@ -48,31 +48,6 @@ export interface StudioDocument {
   scenes: Scene[]
 }
 
-export interface PendingChange {
-  id: string
-  label: string
-  createdAt: string
-  status: 'pending' | 'accepted' | 'rejected'
-  before: StudioDocument
-  after: StudioDocument
-  note: string
-}
-
-export interface FrozenVersion {
-  id: string
-  name: string
-  createdAt: string
-  document: StudioDocument
-  totalDuration: number
-}
-
-export interface StudioState {
-  document: StudioDocument
-  pending: PendingChange[]
-  frozen: FrozenVersion[]
-  updatedAt: string
-}
-
 export interface WarningItem {
   id: string
   type: 'collision' | 'missing-sfx' | 'over-time'

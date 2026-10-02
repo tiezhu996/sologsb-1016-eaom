@@ -14,45 +14,72 @@ import {
   NSpace,
   NTabPane,
   NTabs,
-  NTag
+  NTag,
+  NTooltip
 } from 'naive-ui'
-import { useStudio } from './useStudio'
+import { useCollab } from './useCollab'
+import { makeScript } from './engine'
 import type { Cue, CueKind, Rate } from './types'
+import type { Conflict } from './sync/types'
 
-const studio = useStudio()
+const studio = useCollab()
 const {
-  state,
-  selectedSceneId,
-  selectedScene,
-  totalDuration,
-  pendingChanges,
-  warnings,
+  identity,
+  online,
+  peers,
   saveState,
-  durationOfCue,
-  durationOfScene,
+  incomingStats,
+  document,
+  conflicts: allConflicts,
+  unresolvedConflicts,
+  warnings,
+  totalDuration,
+  pendingBatches,
+  acceptedBatches,
+  rejectedBatches,
+  frozenEvents,
+  exportBlockers,
+  freezeWarnings,
+  canFreeze,
   updateProject,
   updateScene,
   updateCue,
-  addScene,
   deleteScene,
-  addCue,
   deleteCue,
   moveCue,
   moveScene,
-  acceptChange,
-  rejectChange,
-  acceptAll,
-  undo,
-  redo,
+  undoLastLocal,
+  acceptBatch,
+  rejectBatch,
+  acceptAllPending,
+  resolveConflict,
+  resolveConflicts,
+  conflictLabel,
   freeze,
-  downloadVersion,
-  resetSample
+  restoreFreeze,
+  restoreBatch,
+  setupChannel,
+  pushToPeers,
+  importPacketFile,
+  downloadPacket,
+  setIdentity,
+  cueProvenance,
+  sceneProvenance,
+  durationOfCue,
+  durationOfScene
 } = studio
 
+const selectedSceneId = ref(document.value.scenes[0]?.id ?? '')
+const selectedScene = computed(() => document.value.scenes.find((scene) => scene.id === selectedSceneId.value) ?? document.value.scenes[0])
 const dragCueId = ref('')
 const showFreezeModal = ref(false)
 const freezeName = ref('')
-const activeRightTab = ref('warnings')
+const showIdentityModal = ref(false)
+const identityDraftRole = ref<'director' | 'writer'>('director')
+const identityDraftLabel = ref('')
+const activeRightTab = ref('conflicts')
+const fileInput = ref<HTMLInputElement | null>(null)
+const syncMessage = ref('')
 
 const kindOptions = [
   { label: '台词', value: 'dialogue' },
@@ -66,8 +93,8 @@ const rateOptions: Array<{ label: string; value: Rate }> = [
   { label: '偏快 1.1×', value: 1.1 },
   { label: '快 1.2×', value: 1.2 }
 ]
-const characterOptions = computed(() => state.value.document.characters.map((item) => ({ label: `${item.name} / ${item.voiceActor}`, value: item.id })))
-const effectOptions = computed(() => state.value.document.soundEffects.map((item) => ({ label: `${item.name} (${item.duration}s)`, value: item.id })))
+const characterOptions = computed(() => document.value.characters.map((item) => ({ label: `${item.name} / ${item.voiceActor}`, value: item.id })))
+const effectOptions = computed(() => document.value.soundEffects.map((item) => ({ label: `${item.name} (${item.duration}s)`, value: item.id })))
 const themeOverrides = {
   common: {
     primaryColor: '#73daca',
@@ -86,19 +113,30 @@ const themeOverrides = {
   Card: { borderColor: '#252f40' },
   Tab: { tabTextColorActiveLine: '#73daca', barColor: '#73daca' }
 }
+
+const isDirector = computed(() => identity.value.role === 'director')
+const roleLabel = computed(() => isDirector.value ? `🎬 ${identity.value.label}（导演）` : `✍️ ${identity.value.label}（编剧）`)
 const projectMinutes = computed(() => `${Math.floor(totalDuration.value / 60)}:${String(Math.round(totalDuration.value % 60)).padStart(2, '0')}`)
-const pendingCount = computed(() => pendingChanges.value.length)
+const pendingCount = computed(() => pendingBatches.value.length)
+const acceptedCount = computed(() => acceptedBatches.value.length)
+const rejectedCount = computed(() => rejectedBatches.value.length)
 const warningCount = computed(() => warnings.value.length)
+const conflictCount = computed(() => unresolvedConflicts.value.length)
 const saveLabel = computed(() => saveState.value === 'saved' ? '已保存到本机' : '正在保存…')
+const onlineLabel = computed(() => online.value ? `在线 · ${peers.value.size} 个同组窗口` : '离线编辑中')
 
 function cueName(cue: Cue) {
-  if (cue.kind === 'dialogue') return state.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
-  if (cue.kind === 'sfx') return state.value.document.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失音效'
+  if (cue.kind === 'dialogue') return document.value.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
+  if (cue.kind === 'sfx') return document.value.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失音效'
   return '转场'
 }
 
 function sceneStatus(sceneId: string) {
   return warnings.value.some((warning) => warning.sceneId === sceneId) ? 'warning' : 'ok'
+}
+
+function addScene() {
+  selectedSceneId.value = studio.addScene()
 }
 
 function dropCue(targetId: string) {
@@ -109,53 +147,165 @@ function dropCue(targetId: string) {
 
 function goToScene(sceneId: string) {
   selectedSceneId.value = sceneId
-  document.querySelector('.editor-column')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  window.document.querySelector('.editor-column')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 function changeCueKind(cue: Cue, kind: CueKind) {
   updateCue(cue.id, 'kind', kind)
-  if (kind === 'dialogue' && !cue.characterId) updateCue(cue.id, 'characterId', state.value.document.characters[0]?.id)
-  if (kind === 'sfx' && !cue.soundEffectId) updateCue(cue.id, 'soundEffectId', state.value.document.soundEffects[0]?.id)
+  if (kind === 'dialogue' && !cue.characterId) updateCue(cue.id, 'characterId', document.value.characters[0]?.id)
+  if (kind === 'sfx' && !cue.soundEffectId) updateCue(cue.id, 'soundEffectId', document.value.soundEffects[0]?.id)
   if (kind === 'transition') updateCue(cue.id, 'transition', cue.transition || '淡出')
 }
 
+function addCue(kind: CueKind) {
+  if (!selectedScene.value) return
+  studio.addCue(kind, selectedScene.value.id)
+}
+
+/* ---------------- 冲突裁决 ---------------- */
+
+function fieldLabel(field: string) {
+  const map: Record<string, string> = {
+    text: '台词/说明', emotion: '情绪', rate: '语速', characterId: '角色', soundEffectId: '音效',
+    transition: '转场', manualDuration: '时长', code: '场次号', title: '标题', location: '空间',
+    timeOfDay: '时间', durationLimit: '限额', __deleted: '删除/保留'
+  }
+  return map[field] ?? field
+}
+
+function candidateText(conflict: Conflict, side: 'A' | 'B') {
+  const chosen = side === 'A' ? conflict.sideA : conflict.sideB
+  if (chosen.deleted) return '（删除）'
+  const parts = conflict.fields.map((field) => {
+    const value = chosen.fallback[field]
+    if (value === undefined) return ''
+    return `${fieldLabel(field)}：${formatValue(field, value)}`
+  }).filter(Boolean)
+  return parts.join('　')
+}
+
+function formatValue(field: string, value: unknown) {
+  if (field === 'characterId') return document.value.characters.find((c) => c.id === value)?.name ?? value
+  if (field === 'soundEffectId') return document.value.soundEffects.find((c) => c.id === value)?.name ?? value
+  if (field === 'rate') return `${value}×`
+  return String(value)
+}
+
+function chooseSide(conflict: Conflict, side: 'A' | 'B') {
+  resolveConflict(conflict, side)
+}
+
+function acceptAllWithSide(side: 'A' | 'B') {
+  resolveConflicts(unresolvedConflicts.value.map((conflict) => ({ conflict, winner: side })))
+}
+
+/* ---------------- 冻结导出 ---------------- */
+
 function openFreeze() {
-  freezeName.value = `制作稿 v${state.value.frozen.length + 1}`
+  freezeName.value = `制作稿 v${frozenEvents.value.length + 1}`
   showFreezeModal.value = true
 }
 
 function confirmFreeze() {
-  const version = freeze(freezeName.value)
+  const event = freeze(freezeName.value)
   showFreezeModal.value = false
-  downloadVersion(version)
+  if (event) downloadText(event.document.title, event.name, makeScript(event.document))
+}
+
+function downloadText(title: string, name: string, text: string) {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = window.document.createElement('a')
+  anchor.href = url
+  anchor.download = `${title}-${name}.txt`.replace(/[\\/:*?"<>|]/g, '-')
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+function downloadFrozen(eventId: string) {
+  const event = frozenEvents.value.find((item) => item.id === eventId)
+  if (event) downloadText(event.document.title, event.name, makeScript(event.document))
+}
+
+/* ---------------- 身份与同步 ---------------- */
+
+function openIdentity(role: 'director' | 'writer') {
+  identityDraftRole.value = role
+  identityDraftLabel.value = role === 'director' ? '导演端' : '编剧端'
+  showIdentityModal.value = true
+}
+
+function confirmIdentity() {
+  setIdentity(identityDraftRole.value, identityDraftLabel.value)
+  showIdentityModal.value = false
+}
+
+function triggerImport() {
+  fileInput.value?.click()
+}
+
+async function onImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    const added = await importPacketFile(file)
+    syncMessage.value = added ? `已合并 ${added} 条来自其他窗口的记录` : '没有新记录，两边已是一致状态'
+  } catch (error) {
+    syncMessage.value = `导入失败：${(error as Error).message}`
+  } finally {
+    input.value = ''
+    window.setTimeout(() => { syncMessage.value = '' }, 4000)
+  }
+}
+
+function manualSync() {
+  pushToPeers()
+  syncMessage.value = '已向同组窗口推送当前全部记录'
+  window.setTimeout(() => { syncMessage.value = '' }, 2500)
+}
+
+/* ---------------- 批次展示 ---------------- */
+
+function batchClientTag(clientId: string) {
+  return clientId === identity.value.clientId ? '本窗口' : `窗口 ${clientId.slice(-4)}`
+}
+
+function provenanceText(cueId: string) {
+  const prov = cueProvenance(cueId)
+  return prov ? `最后来源：${prov.author.label}（${batchClientTag(prov.clientId)}）· ${new Date(prov.at).toLocaleString('zh-CN')}` : '初始剧本内容'
+}
+
+function sceneProvText(sceneId: string) {
+  const prov = sceneProvenance(sceneId)
+  return prov ? `最后来源：${prov.author.label}（${batchClientTag(prov.clientId)}）· ${new Date(prov.at).toLocaleString('zh-CN')}` : '初始剧本内容'
 }
 
 function onKeydown(event: KeyboardEvent) {
   const command = event.ctrlKey || event.metaKey
   if (command && event.key.toLowerCase() === 's') {
     event.preventDefault()
-    studio.persist()
+    pushToPeers()
   }
   if (command && event.key.toLowerCase() === 'z') {
     event.preventDefault()
-    event.shiftKey ? redo() : undo()
-  }
-  if (command && event.key.toLowerCase() === 'y') {
-    event.preventDefault()
-    redo()
+    undoLastLocal()
   }
   if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown') && selectedScene.value) {
     event.preventDefault()
     moveScene(selectedScene.value.id, event.key === 'ArrowUp' ? -1 : 1)
   }
   if (event.key === '[' || event.key === ']') {
-    const index = state.value.document.scenes.findIndex((scene) => scene.id === selectedScene.value?.id)
+    const index = document.value.scenes.findIndex((scene) => scene.id === selectedScene.value?.id)
     const next = event.key === '[' ? index - 1 : index + 1
-    if (state.value.document.scenes[next]) selectedSceneId.value = state.value.document.scenes[next].id
+    if (document.value.scenes[next]) selectedSceneId.value = document.value.scenes[next].id
   }
 }
 
-onMounted(() => window.addEventListener('keydown', onKeydown))
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+  setupChannel()
+})
 onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
@@ -167,37 +317,45 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <div class="brand-mark">声</div>
           <div>
             <strong>声场制作台</strong>
-            <span>RADIO DRAMA STUDIO</span>
+            <span>RADIO DRAMA STUDIO · 双端协同</span>
           </div>
         </div>
         <div class="project-fields">
-          <n-input :value="state.document.title" aria-label="项目标题" @update:value="updateProject('title', $event)" />
-          <n-input :value="state.document.subtitle" aria-label="项目副标题" @update:value="updateProject('subtitle', $event)" />
+          <n-input :value="document.title" aria-label="项目标题" @update:value="updateProject('title', $event)" />
+          <n-input :value="document.subtitle" aria-label="项目副标题" @update:value="updateProject('subtitle', $event)" />
         </div>
         <div class="top-actions">
+          <n-tag size="small" :bordered="false" :type="online ? 'success' : 'warning'">{{ onlineLabel }}</n-tag>
+          <n-tag size="small" :bordered="false" :type="isDirector ? 'info' : 'default'">
+            {{ roleLabel }}
+          </n-tag>
           <span class="save-state">{{ saveLabel }}</span>
-          <n-button quaternary @click="undo">撤销 ⌘Z</n-button>
-          <n-button quaternary @click="redo">重做 ⇧⌘Z</n-button>
-          <n-button type="primary" @click="openFreeze">冻结并导出</n-button>
+          <n-button quaternary size="small" @click="openIdentity('director')">切换导演</n-button>
+          <n-button quaternary size="small" @click="openIdentity('writer')">切换编剧</n-button>
         </div>
       </header>
+
+      <section v-if="conflictCount" class="conflict-banner" @click="activeRightTab = 'conflicts'">
+        <span>⚖️ 检测到 {{ conflictCount }} 处双端同时修改，已保留两份内容，等待导演裁决后才能导出制作稿</span>
+        <n-button size="tiny" type="primary">前往确认区</n-button>
+      </section>
 
       <section class="summary-strip">
         <div class="metric">
           <span>预计总时长</span>
           <strong>{{ projectMinutes }}</strong>
-          <small>{{ totalDuration.toFixed(1) }} / {{ state.document.targetDuration }} 秒</small>
+          <small>{{ totalDuration.toFixed(1) }} / {{ document.targetDuration }} 秒</small>
         </div>
         <div class="target-control">
           <n-progress
             type="line"
-            :percentage="Math.min(100, Number(((totalDuration / state.document.targetDuration) * 100).toFixed(1)))"
+            :percentage="Math.min(100, Number(((totalDuration / document.targetDuration) * 100).toFixed(1)))"
             :height="8"
             :show-indicator="false"
-            :status="totalDuration > state.document.targetDuration ? 'error' : 'success'"
+            :status="totalDuration > document.targetDuration ? 'error' : 'success'"
           />
           <n-input-number
-            :value="state.document.targetDuration"
+            :value="document.targetDuration"
             size="small"
             :min="30"
             :step="10"
@@ -207,13 +365,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           </n-input-number>
         </div>
         <div class="metric compact">
-          <span>场次</span><strong>{{ state.document.scenes.length }}</strong>
+          <span>场次</span><strong>{{ document.scenes.length }}</strong>
         </div>
         <div class="metric compact">
           <span>待确认</span><strong class="accent">{{ pendingCount }}</strong>
         </div>
         <div class="metric compact">
-          <span>检查项</span><strong :class="{ danger: warningCount }">{{ warningCount }}</strong>
+          <span>冲突</span><strong :class="{ danger: conflictCount }">{{ conflictCount }}</strong>
         </div>
       </section>
 
@@ -228,7 +386,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           </div>
           <div class="scene-list">
             <button
-              v-for="(scene, index) in state.document.scenes"
+              v-for="(scene, index) in document.scenes"
               :key="scene.id"
               class="scene-item"
               :class="{ active: scene.id === selectedSceneId, warning: sceneStatus(scene.id) === 'warning' }"
@@ -238,17 +396,25 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <span class="scene-copy">
                 <strong>{{ scene.code }} · {{ scene.title }}</strong>
                 <small>{{ scene.location }} / {{ scene.timeOfDay }}</small>
+                <small class="prov">{{ sceneProvText(scene.id) }}</small>
               </span>
               <span class="scene-duration">{{ durationOfScene(scene).toFixed(0) }}s</span>
             </button>
           </div>
           <div class="sidebar-tip">
-            <strong>键盘工作流</strong>
-            <span>[ / ] 切换场次</span>
-            <span>Alt + ↑ / ↓ 调整顺序</span>
-            <span>⌘S 立即保存 · ⌘Z 撤销</span>
+            <strong>离线协同工作流</strong>
+            <span>断网可继续编辑，记录留在本窗口</span>
+            <span>恢复后自动合并，或用文件手动同步</span>
+            <span>[ / ] 切场次 · ⌘Z 撤销 · ⌘S 推送</span>
           </div>
-          <n-button block quaternary @click="resetSample">恢复示例数据</n-button>
+          <n-space vertical :size="6">
+            <n-button block secondary @click="manualSync">立即推送给同组窗口</n-button>
+            <n-button block quaternary @click="downloadPacket">导出同步文件</n-button>
+            <n-button block quaternary @click="triggerImport">导入同步文件</n-button>
+            <input ref="fileInput" type="file" accept="application/json" hidden @change="onImportFile" />
+          </n-space>
+          <p v-if="syncMessage" class="sync-msg">{{ syncMessage }}</p>
+          <p v-if="incomingStats" class="sync-msg subtle">最近合并 {{ incomingStats.at.slice(11, 19) }}：{{ incomingStats.added }} 条新记录</p>
         </aside>
 
         <section v-if="selectedScene" class="editor-column">
@@ -256,6 +422,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             <div>
               <span class="eyebrow">SCENE {{ selectedScene.code }}</span>
               <input class="title-input" :value="selectedScene.title" aria-label="场次标题" @change="updateScene(selectedScene.id, 'title', ($event.target as HTMLInputElement).value)" />
+              <small class="prov-inline">{{ sceneProvText(selectedScene.id) }}</small>
             </div>
             <div class="scene-order-actions">
               <n-button size="small" secondary @click="moveScene(selectedScene.id, -1)">上移</n-button>
@@ -303,6 +470,12 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   <n-select class="kind-select" size="small" :value="cue.kind" :options="kindOptions" @update:value="changeCueKind(cue, $event)" />
                   <n-tag size="small" :bordered="false">{{ cueName(cue) }}</n-tag>
                   <span class="duration-pill">{{ durationOfCue(cue).toFixed(1) }}s</span>
+                  <n-tooltip trigger="hover">
+                    <template #trigger>
+                      <span class="prov-dot" title="溯源">◎</span>
+                    </template>
+                    {{ provenanceText(cue.id) }}
+                  </n-tooltip>
                   <n-button size="tiny" tertiary type="error" @click="deleteCue(cue.id)">删除</n-button>
                 </div>
 
@@ -345,9 +518,100 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <span class="eyebrow">REVIEW DESK</span>
               <h2>导演确认区</h2>
             </div>
-            <n-button v-if="pendingCount" size="small" type="primary" secondary @click="acceptAll">全部接受</n-button>
+            <n-button v-if="isDirector && pendingCount" size="small" type="primary" secondary @click="acceptAllPending">全部接受</n-button>
           </div>
+
+          <n-alert v-if="!isDirector" type="warning" class="role-alert" :show-icon="false">
+            当前是编剧身份：可以离线编辑，但接受/退回/裁决/冻结仅导演可操作。
+            <n-button size="tiny" quaternary @click="openIdentity('director')">切换为导演</n-button>
+          </n-alert>
+
           <n-tabs v-model:value="activeRightTab" type="line" animated>
+            <n-tab-pane name="conflicts" :tab="`冲突 ${conflictCount}`">
+              <div class="review-list">
+                <div v-if="conflictCount && isDirector" class="bulk-row">
+                  <n-button size="tiny" secondary @click="acceptAllWithSide('A')">全部采用 A 侧</n-button>
+                  <n-button size="tiny" secondary @click="acceptAllWithSide('B')">全部采用 B 侧</n-button>
+                </div>
+                <div v-for="conflict in allConflicts" :key="conflict.id" class="conflict-card" :class="{ resolved: conflict.resolution }">
+                  <div class="conflict-head">
+                    <strong>{{ conflictLabel(conflict) }}</strong>
+                    <n-tag size="tiny" :bordered="false" :type="conflict.resolution ? 'success' : 'error'">
+                      {{ conflict.resolution ? '已裁决' : '待裁决' }}
+                    </n-tag>
+                  </div>
+                  <div class="conflict-fields">
+                    <n-tag v-for="field in conflict.fields" :key="field" size="tiny" :bordered="false">{{ fieldLabel(field) }}</n-tag>
+                  </div>
+                  <div class="conflict-side" :class="{ chosen: false }">
+                    <header>
+                      <n-tag size="tiny" type="info" :bordered="false">A · {{ conflict.sideA.author.label }}</n-tag>
+                      <span>{{ batchClientTag(conflict.sideA.clientId) }}</span>
+                    </header>
+                    <p>{{ candidateText(conflict, 'A') }}</p>
+                    <n-button v-if="isDirector && !conflict.resolution" size="tiny" type="primary" @click="chooseSide(conflict, 'A')">采用 A</n-button>
+                  </div>
+                  <div class="conflict-side">
+                    <header>
+                      <n-tag size="tiny" type="info" :bordered="false">B · {{ conflict.sideB.author.label }}</n-tag>
+                      <span>{{ batchClientTag(conflict.sideB.clientId) }}</span>
+                    </header>
+                    <p>{{ candidateText(conflict, 'B') }}</p>
+                    <n-button v-if="isDirector && !conflict.resolution" size="tiny" type="primary" @click="chooseSide(conflict, 'B')">采用 B</n-button>
+                  </div>
+                  <p v-if="conflict.resolution" class="resolution-note">
+                    ✓ {{ conflict.resolution.label }} · {{ new Date(conflict.resolution.at).toLocaleString('zh-CN') }}
+                  </p>
+                </div>
+                <n-empty v-if="!allConflicts.length" description="双端修改已自动合并，没有字段冲突" />
+              </div>
+            </n-tab-pane>
+
+            <n-tab-pane name="pending" :tab="`待确认 ${pendingCount}`">
+              <div class="review-list">
+                <n-alert type="info" :show-icon="false">每次编辑都会形成带来源的记录。退回较早记录时，其同窗口后续未决修改会一并退回；其他窗口的并发新修改不受影响。</n-alert>
+                <div v-for="batch in pendingBatches" :key="batch.id" class="pending-card" :class="{ stale: batch.rejectedAncestorId }">
+                  <div class="pending-meta">
+                    <strong>{{ batch.label }}</strong>
+                    <span>{{ new Date(batch.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
+                  </div>
+                  <div class="pending-tags">
+                    <n-tag size="tiny" :bordered="false" :type="batch.author.role === 'director' ? 'info' : 'default'">{{ batch.author.label }}</n-tag>
+                    <n-tag size="tiny" :bordered="false">{{ batchClientTag(batch.clientId) }}</n-tag>
+                    <n-tag v-if="batch.batchType === 'undo'" size="tiny" type="warning" :bordered="false">撤销</n-tag>
+                    <n-tag v-if="batch.batchType === 'restore'" size="tiny" type="warning" :bordered="false">还原</n-tag>
+                    <n-tag v-if="batch.conflictIdsCreated.length" size="tiny" type="error" :bordered="false">涉冲突</n-tag>
+                    <n-tag v-if="batch.rejectedAncestorId" size="tiny" type="warning" :bordered="false">旧窗口迟到修改</n-tag>
+                  </div>
+                  <div class="pending-actions">
+                    <n-button size="small" type="primary" :disabled="!isDirector" @click="acceptBatch(batch.id)">接受</n-button>
+                    <n-button size="small" tertiary type="warning" :disabled="!isDirector" @click="rejectBatch(batch.id)">退回</n-button>
+                  </div>
+                </div>
+                <n-empty v-if="!pendingCount" description="所有修改都已确认" />
+              </div>
+            </n-tab-pane>
+
+            <n-tab-pane name="history" :tab="`已确认 ${acceptedCount + rejectedCount}`">
+              <div class="review-list history-list">
+                <div v-for="batch in [...acceptedBatches, ...rejectedBatches]" :key="batch.id" class="history-card" :class="batch.status">
+                  <div class="pending-meta">
+                    <strong>{{ batch.label }}</strong>
+                    <n-tag size="tiny" :bordered="false" :type="batch.status === 'accepted' ? 'success' : 'error'">
+                      {{ batch.status === 'accepted' ? '已接受' : '已退回' }}
+                    </n-tag>
+                  </div>
+                  <p class="history-detail">
+                    {{ batch.author.label }}（{{ batchClientTag(batch.clientId) }}）·
+                    {{ new Date(batch.at).toLocaleString('zh-CN') }}
+                    <template v-if="batch.decisionBy"> · {{ batch.decisionBy.label }}{{ batch.status === 'accepted' ? '接受' : '退回' }}</template>
+                  </p>
+                  <n-button v-if="isDirector" size="tiny" quaternary @click="restoreBatch(batch.id)">还原此记录内容</n-button>
+                </div>
+                <n-empty v-if="!acceptedCount && !rejectedCount" description="还没有已确认的记录" />
+              </div>
+            </n-tab-pane>
+
             <n-tab-pane name="warnings" :tab="`检查 ${warningCount}`">
               <div class="review-list">
                 <div v-for="warning in warnings" :key="warning.id" class="warning-card" :class="warning.level">
@@ -356,43 +620,36 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                     <strong>{{ warning.title }}</strong>
                   </div>
                   <p>{{ warning.detail }}</p>
-                  <n-button size="tiny" quaternary @click="goToScene(warning.sceneId)">定位到 {{ state.document.scenes.find((scene) => scene.id === warning.sceneId)?.code }}</n-button>
+                  <n-button size="tiny" quaternary @click="goToScene(warning.sceneId)">定位到 {{ document.scenes.find((scene) => scene.id === warning.sceneId)?.code }}</n-button>
                 </div>
                 <n-empty v-if="!warnings.length" description="当前没有连续性问题" />
               </div>
             </n-tab-pane>
 
-            <n-tab-pane name="pending" :tab="`待确认 ${pendingCount}`">
-              <div class="pending-toolbar">
-                <n-alert type="info" :show-icon="false">每次编辑都会形成草稿记录。退回较早记录时，其上方尚未确认的草稿会一并撤销。</n-alert>
-              </div>
+            <n-tab-pane name="versions" :tab="`冻结 ${frozenEvents.length}`">
               <div class="review-list">
-                <div v-for="change in state.pending.filter((item) => item.status === 'pending')" :key="change.id" class="pending-card">
-                  <div class="pending-meta">
-                    <strong>{{ change.label }}</strong>
-                    <span>{{ new Date(change.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
-                  </div>
-                  <p v-if="change.note">{{ change.note }}</p>
-                  <div class="pending-actions">
-                    <n-button size="small" type="primary" @click="acceptChange(change.id)">接受</n-button>
-                    <n-button size="small" tertiary type="warning" @click="rejectChange(change.id)">退回</n-button>
-                  </div>
+                <div class="freeze-block">
+                  <n-alert v-if="exportBlockers.length" type="error" :show-icon="false">
+                    <div v-for="blocker in exportBlockers" :key="blocker">· {{ blocker }}</div>
+                  </n-alert>
+                  <n-alert v-else-if="freezeWarnings.length" type="warning" :show-icon="false">
+                    <div v-for="line in freezeWarnings" :key="line">· {{ line }}</div>
+                  </n-alert>
+                  <n-alert v-else type="success" :show-icon="false">冲突已全部裁决，可以冻结导出制作稿。</n-alert>
+                  <n-button type="primary" :disabled="!canFreeze" @click="openFreeze">冻结并导出制作稿</n-button>
                 </div>
-                <n-empty v-if="!pendingCount" description="所有修改都已确认" />
-              </div>
-            </n-tab-pane>
-
-            <n-tab-pane name="versions" :tab="`冻结 ${state.frozen.length}`">
-              <div class="review-list">
-                <div v-for="version in state.frozen" :key="version.id" class="version-card">
+                <div v-for="version in frozenEvents" :key="version.id" class="version-card">
                   <div>
                     <strong>{{ version.name }}</strong>
-                    <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
-                    <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
+                    <span>{{ new Date(version.at).toLocaleString('zh-CN') }}</span>
+                    <small>{{ version.author.label }}（{{ batchClientTag(version.clientId) }}）冻结 · {{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
                   </div>
-                  <n-button size="small" type="primary" secondary @click="downloadVersion(version)">导出稿</n-button>
+                  <n-space :size="6">
+                    <n-button size="small" type="primary" secondary @click="downloadFrozen(version.id)">导出稿</n-button>
+                    <n-button size="small" quaternary @click="restoreFreeze(version.id)">还原到此版本</n-button>
+                  </n-space>
                 </div>
-                <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿" />
+                <n-empty v-if="!frozenEvents.length" description="冻结后生成只读制作稿，可随时还原到该来源" />
               </div>
             </n-tab-pane>
           </n-tabs>
@@ -404,11 +661,24 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
       <div class="dialog-card">
         <span class="eyebrow">FREEZE VERSION</span>
         <h2>冻结当前版本</h2>
-        <p>冻结会保存一份不可变快照，并立即下载纯文本制作稿。当前草稿仍可继续编辑。</p>
+        <p>冻结会保存一份不可变快照（含来源信息），并立即下载纯文本制作稿。冻结后仍可继续编辑。</p>
         <n-input v-model:value="freezeName" placeholder="版本名称" @keyup.enter="confirmFreeze" />
         <div class="dialog-actions">
           <n-button @click="showFreezeModal = false">取消</n-button>
           <n-button type="primary" @click="confirmFreeze">冻结并导出</n-button>
+        </div>
+      </div>
+    </n-modal>
+
+    <n-modal v-model:show="showIdentityModal">
+      <div class="dialog-card">
+        <span class="eyebrow">SWITCH ROLE</span>
+        <h2>切换当前窗口身份</h2>
+        <p>模拟两个浏览器窗口：一个导演端、一个编剧端。身份只保存在本窗口，不会影响其他窗口的数据。</p>
+        <n-input v-model:value="identityDraftLabel" placeholder="窗口名称，如 导演端 / 编剧端" />
+        <div class="dialog-actions">
+          <n-button @click="showIdentityModal = false">取消</n-button>
+          <n-button type="primary" @click="confirmIdentity">切换为{{ identityDraftRole === 'director' ? '导演' : '编剧' }}</n-button>
         </div>
       </div>
     </n-modal>

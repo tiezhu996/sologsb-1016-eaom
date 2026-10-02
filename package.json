@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "test:sync": "esbuild scripts/sync.test.ts --bundle --platform=node --format=esm --outfile=/tmp/sync-test.mjs && node /tmp/sync-test.mjs"
   },
   "dependencies": {
     "naive-ui": "^2.40.4",
